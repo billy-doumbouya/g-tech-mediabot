@@ -283,21 +283,21 @@ const createPost = async (page, imagePath, caption) => {
         const publishBtn = buttons.find(
           (b) =>
             b.textContent.trim() === "Publier" ||
-            b.textContent.trim() === "Post" ||
-            b.textContent.trim() === "Poster",
+            b.textContent.trim() === "Post",
         );
         if (publishBtn) publishBtn.click();
       });
       published = true;
-      logger.debug("✅ Publish button clicked via text search");
-    } catch {
-      /* failed */
+      logger.debug("✅ Publish button clicked via text content search");
+    } catch (error) {
+      logger.error("❌ Last resort publish failed", { error: error.message });
     }
   }
 
+  // Final confirmation check
   if (!published) {
     throw new Error(
-      "Could not find publish button. Check generated-images/debug-before-publish.png",
+      "Could not find or click the publish button. Check generated-images/debug-before-publish.png",
     );
   }
 
