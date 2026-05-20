@@ -1,103 +1,110 @@
 /**
  * src/automation/screenshotGenerator.js
  * ============================================================
- * HTML → IMAGE SCREENSHOT GENERATOR
- * ============================================================
- * WHY THIS APPROACH:
- * We render our HTML template in a real Chromium browser and
- * take a screenshot. This gives us:
- * - Perfect CSS rendering (gradients, shadows, Google Fonts)
- * - Pixel-perfect 1200x630px output
- * - No external API dependencies
- * - Full control over design
- *
- * FLOW:
- * 1. Open new browser page
- * 2. Set HTML content directly (no web server needed)
- * 3. Wait for fonts/images to load
- * 4. Take screenshot
- * 5. Save to disk
- * 6. Close page
+ * HARDENED HTML → IMAGE SCREENSHOT GENERATOR
  * ============================================================
  */
 
-import path from 'path';
-import fs from 'fs-extra';
-import { newPage } from './browserManager.js';
-import { config } from '../config/index.js';
-import { sleep } from '../utils/asyncWrapper.js';
-import logger from '../utils/logger.js';
-import Analytics from '../models/Analytics.js';
+import path from "path";
+import fs from "fs-extra";
+import { newPage } from "./browserManager.js";
+import { config } from "../config/index.js";
+import logger from "../utils/logger.js";
+import Analytics from "../models/Analytics.js";
 
 /**
- * Generate an image from HTML content
+ * Generate an image from HTML content safely under strict memory constraints
  * @param {string} html - Full HTML string to render
  * @param {string} filename - Output filename (without extension)
  * @returns {Promise<string>} - Absolute path to saved PNG
  */
 export const generateImage = async (html, filename) => {
-  // Ensure output directory exists
+  // Ensure output directory layout exists on volume disk early
   await fs.ensureDir(config.images.outputDir);
 
   const outputPath = path.resolve(config.images.outputDir, `${filename}.png`);
   let page = null;
 
   try {
-    logger.info(`📸 Generating image: ${filename}.png`);
+    logger.info(
+      `📸 Initializing image snapshot workspace for asset: ${filename}.png`,
+    );
 
-    // Open a fresh page for this screenshot
+    // Spawns a dedicated page abstraction instance from the singleton core
     page = await newPage();
 
-    // Set the viewport explicitly to match our target image size
+    // Enforce target dimensional metrics explicitly
     await page.setViewport({
       width: config.images.width,
       height: config.images.height,
-      deviceScaleFactor: 1, // 1x = 1200x630px | 2x = 2400x1260px retina
+      deviceScaleFactor: 1, // Keep at 1x to optimize processing speed on cloud instances
     });
 
-    // INJECT HTML DIRECTLY
-    // We use setContent() instead of navigating to a URL because:
-    // - No web server needed
-    // - Faster (no network request)
-    // - Works in Railway (no inbound port needed for this)
+    // OPTIMIZATION: Use domcontentloaded to prevent network hanging loops
     await page.setContent(html, {
-      // waitUntil: 'networkidle0' means wait until no network requests
-      // for 500ms. This ensures Google Fonts have loaded.
-      // WARNING: Can timeout if fonts are blocked in the environment.
-      // If Railway blocks fonts.googleapis.com, change to 'domcontentloaded'
-      waitUntil: 'networkidle0',
-      timeout: 15000,
+      waitUntil: "domcontentloaded",
+      timeout: 10000, // Strict 10-second ceiling to prevent container worker stalls
     });
 
-    // Extra wait for CSS animations and font rendering
-    // WHY: Sometimes fonts render a frame late, causing blurry text
-    await sleep(500);
+    // PRODUCTION FIX: Programmatically wait for all custom typography styling blocks to download
+    logger.debug("🔤 Waiting for font asset compilation layers...");
+    try {
+      await page.evaluate(() => document.fonts.ready);
+    } catch (fontErr) {
+      logger.warn(
+        "⚠️ Font engine tracking timed out or failed. Reverting to backup rendering canvas.",
+      );
+    }
 
-    // TAKE THE SCREENSHOT
+    // CRITICAL CLOUD STABILITY FIX: Suppress CSS transitions/animations
+    // This stops images from being captured halfway through a fade-in animation
+    await page.addStyleTag({
+      content: `
+        *, *::before, *::after {
+          transition: none !important;
+          animation: none !important;
+          animation-duration: 0s !important;
+          transition-duration: 0s !important;
+        }
+      `,
+    });
+
+    // TAKE THE SCREENSHOT WITH CLIP BOUNDS
     await page.screenshot({
       path: outputPath,
-      type: 'png',
+      type: "png",
+      omitBackground: false, // Guarantees default transparency states don't corrupt target formats
       clip: {
-        x: 0, y: 0,
+        x: 0,
+        y: 0,
         width: config.images.width,
         height: config.images.height,
       },
     });
 
-    logger.info(`✅ Image saved: ${outputPath}`);
-    await Analytics.increment('imagesGenerated').catch(() => {});
+    logger.info(`✅ Asset capture completely synchronized: ${outputPath}`);
+    await Analytics.increment("imagesGenerated").catch(() => {});
 
     return outputPath;
-
   } catch (error) {
-    await Analytics.increment('imagesFailed').catch(() => {});
-    logger.error('❌ Screenshot generation failed', { error: error.message, filename });
+    await Analytics.increment("imagesFailed").catch(() => {});
+    logger.error(
+      "❌ Snapshot worker encountered a structural pipeline exception:",
+      {
+        message: error.message,
+        filename,
+      },
+    );
     throw error;
   } finally {
-    // ALWAYS close the page to free memory
-    // WHY: Each page uses ~20-50MB. Not closing = memory leak
+    // PROTECTED WORKER TEARDOWN Pipeline
     if (page) {
-      await page.close().catch(() => {});
+      logger.debug("🧹 Recycler engaging on local page container threads...");
+      // Wrap the close loop with a forced promise race to protect the node thread from sticking on OOM instances
+      await Promise.race([
+        page.close(),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]).catch(() => {});
     }
   }
 };

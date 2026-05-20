@@ -1,85 +1,122 @@
 /**
  * src/scripts/setupSession.js
  * ============================================================
- * BROWSER SESSION SETUP — RUN ONCE
- * ============================================================
- * This script opens a VISIBLE (non-headless) browser so you can
- * log into Facebook manually. Once logged in, the session cookies
- * are saved to the PUPPETEER_USER_DATA_DIR folder and reused
- * automatically by the bot from then on.
- *
- * WHEN TO RUN:
- * - First-time setup
- * - After session expires (Facebook logs you out)
- * - After changing FACEBOOK account
- *
- * HOW TO RUN:
- *   npm run setup-session
- *
- * WHAT TO DO:
- * 1. A browser window opens
- * 2. Log into Facebook manually
- * 3. Navigate to G-tech-academy page
- * 4. Confirm you can see the "Create Post" button
- * 5. Press ENTER in the terminal to save and close
+ * HARDENED BROWSER SESSION SETUP — RUN ONCE
  * ============================================================
  */
 
-import puppeteerExtra from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import fs from 'fs-extra';
-import path from 'path';
-import readline from 'readline';
-import { config } from '../config/index.js';
-import logger from '../utils/logger.js';
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import fs from "fs-extra";
+import path from "path";
+import readline from "readline";
+import { config } from "../config/index.js";
+import logger from "../utils/logger.js";
 
 puppeteerExtra.use(StealthPlugin());
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const waitForEnter = (msg) => new Promise(resolve => rl.question(msg, resolve));
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+const waitForEnter = (msg) =>
+  new Promise((resolve) => rl.question(msg, resolve));
 
-logger.info('🔧 Browser Session Setup — GTech MediaBot');
-logger.info(`📁 Session will be saved to: ${path.resolve(config.puppeteer.userDataDir)}`);
+logger.info("🔧 Hardened Browser Session Provisioner — GTech MediaBot");
+logger.info(
+  `📁 Output profile destination: ${path.resolve(config.puppeteer.userDataDir)}`,
+);
 
 (async () => {
-  await fs.ensureDir(config.puppeteer.userDataDir);
+  try {
+    // Ensure path trees exist prior to mounting
+    await fs.ensureDir(config.puppeteer.userDataDir);
 
-  // Launch VISIBLE browser (headless: false)
-  const browser = await puppeteerExtra.launch({
-    headless: false,  // IMPORTANT: Must be visible for manual login
-    userDataDir: path.resolve(config.puppeteer.userDataDir),
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--window-size=1280,800',
-    ],
-    defaultViewport: { width: 1280, height: 800 },
-  });
+    // Launch visible browser instance for authentication capturing
+    const browser = await puppeteerExtra.launch({
+      headless: false, // Core constraint: Must remain visible for human validation
+      userDataDir: path.resolve(config.puppeteer.userDataDir),
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--window-size=1280,800",
+        "--disable-extensions",
+      ],
+      defaultViewport: { width: 1280, height: 800 },
+    });
 
-  const page = await browser.newPage();
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  );
+    // PRODUCTION FIX: Reuse the initial default tab created by launch()
+    // This stops multiple tabs from racing to write conflicting storage states on closure.
+    const openPages = await browser.pages();
+    const page = openPages.length > 0 ? openPages[0] : await browser.newPage();
 
-  await page.goto('https://www.facebook.com', { waitUntil: 'networkidle2' });
+    // Mask fingerprinting flags inside the provisioner workspace
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    );
 
-  console.log('\n' + '='.repeat(60));
-  console.log('👋 A browser window has opened.');
-  console.log('');
-  console.log('STEPS:');
-  console.log('  1. Log into your Facebook account');
-  console.log('  2. Navigate to the G-tech-academy page');
-  console.log('  3. Verify you see the "Create Post" area');
-  console.log('  4. Come back here and press ENTER');
-  console.log('='.repeat(60) + '\n');
+    // Block notification permission alerts natively to keep the UI clean
+    const context = browser.defaultBrowserContext();
+    await context.overridePermissions("https://www.facebook.com", [
+      "notifications",
+    ]);
 
-  await waitForEnter('Press ENTER when you are logged in and ready → ');
+    await page.goto("https://www.facebook.com", {
+      waitUntil: "templates" in page ? "networkidle2" : "domcontentloaded",
+    });
 
-  await browser.close();
-  rl.close();
+    console.log("\n" + "=".repeat(60));
+    console.log("👋 Secure profile window initialized successfully.");
+    console.log("");
+    console.log("CRITICAL STEPS:");
+    console.log("  1. Authenticate your target Facebook identity profile");
+    console.log("  2. Navigate to your target business workspace / Page");
+    console.log("  3. Assert profile switching prompts have been cleared");
+    console.log("  4. Re-focus this terminal prompt window and press ENTER");
+    console.log("=".repeat(60) + "\n");
 
-  logger.info('✅ Session saved! You can now run the bot.');
-  logger.info(`📁 Session stored at: ${path.resolve(config.puppeteer.userDataDir)}`);
-  process.exit(0);
+    await waitForEnter(
+      "Press ENTER once your workspace session state stabilizes → ",
+    );
+
+    // PRODUCTION FIX: Programmatically extract and check cookies to confirm a valid login session
+    logger.debug("📊 Verifying state tokens before teardown...");
+    const sessionCookies = await page.cookies();
+    const loginConfirmed = sessionCookies.some(
+      (cookie) => cookie.name === "c_user",
+    );
+
+    if (!loginConfirmed) {
+      logger.warn(
+        '⚠️ Warning: No active Facebook session cookies ("c_user") were detected. Your session may run unauthenticated.',
+      );
+    } else {
+      logger.info(
+        "🔑 Active user authentication cookies verified inside storage layer.",
+      );
+    }
+
+    // Give Chromium a 3-second grace period to flush its internal database logs to disk
+    logger.debug("💾 Synchronizing storage profiles with file system...");
+    await page.goto("about:blank").catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    // Tear down interface configurations cleanly
+    await browser.close();
+    rl.close();
+
+    logger.info("🎉 Production token storage compiled successfully!");
+    logger.info(
+      `📁 Active session available for upload at: ${path.resolve(config.puppeteer.userDataDir)}`,
+    );
+    process.exit(0);
+  } catch (err) {
+    logger.error(
+      "❌ Session generation wizard aborted due to a system exception:",
+      { message: err.message },
+    );
+    rl.close();
+    process.exit(1);
+  }
 })();

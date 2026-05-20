@@ -1,136 +1,283 @@
 /**
  * src/schedulers/postScheduler.js
  * ============================================================
- * POST SCHEDULER — 3X DAILY AUTOMATED POSTING
+ * DISTRIBUTION-SAFE PRODUCTION SCHEDULER
  * ============================================================
- * WHY SCHEDULERS ARE ISOLATED:
- * Cron job definitions don't belong in app.js or services.
- * They have their own lifecycle (start, stop) and concerns.
- * Keeping them isolated makes it easy to:
- * - Add/remove schedules without touching other code
- * - Test scheduling logic independently
- * - See all schedules in one place
+ * FEATURES:
+ * - Safe cron initialization
+ * - Timezone validation
+ * - Fail-fast configuration validation
+ * - Overlap protection
+ * - Execution timeout protection
+ * - Structured logging
+ * - Graceful shutdown
+ * - Scalable schedule registry
+ * - Task destruction support
  *
- * HOW NODE-CRON WORKS:
- * Cron expressions: "0 8 * * *"
- *                    │ │ │ │ │
- *                    │ │ │ │ └── Day of week (0-7, 0=Sunday)
- *                    │ │ │ └──── Month (1-12)
- *                    │ │ └────── Day of month (1-31)
- *                    │ └──────── Hour (0-23)
- *                    └────────── Minute (0-59)
+ * NOTE:
+ * This version is production-safe for SINGLE INSTANCE deployments.
  *
- * "0 8 * * *" = Every day at 08:00
+ * For horizontally scaled deployments:
+ * - PM2 cluster
+ * - Kubernetes
+ * - Docker replicas
+ * - Railway autoscaling
+ *
+ * Add:
+ * - Redis distributed locks
+ * - BullMQ / Agenda / Temporal
  * ============================================================
  */
 
-import cron from 'node-cron';
-import { config } from '../config/index.js';
-import { runPostPipeline } from '../services/postService.js';
-import logger from '../utils/logger.js';
+import cron from "node-cron";
 
-// Store references to active cron tasks so we can stop them gracefully
+import { config } from "../config/index.js";
+import { runPostPipeline } from "../services/postService.js";
+import logger from "../utils/logger.js";
+
+// ============================================================
+// INTERNAL STATE
+// ============================================================
+
 const activeTasks = [];
+const runningPipelines = new Set();
+
+let schedulerInitialized = false;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const PIPELINE_TIMEOUT_MS = 1000 * 60 * 30; // 30 minutes
+
+// ============================================================
+// VALIDATION HELPERS
+// ============================================================
 
 /**
- * Build a cron expression for a given hour
- * @param {number} hour - Hour in 24h format
- * @returns {string} - Cron expression
+ * Validate timezone safely using Intl
  */
-const hourToCron = (hour) => `0 ${hour} * * *`;
-
-/**
- * Initialize all scheduled post jobs
- * Called once during app startup
- */
-export const initScheduler = () => {
-  logger.info('⏰ Initializing post scheduler...');
-
-  const { morningHour, middayHour, eveningHour, timezone } = config.scheduler;
-
-  // ============================================================
-  // JOB 1: MORNING POST
-  // ============================================================
-  const morningJob = cron.schedule(
-    hourToCron(morningHour),
-    async () => {
-      logger.info(`🌅 [SCHEDULER] Morning post triggered (${morningHour}:00 ${timezone})`);
-      await runScheduledPost('morning');
-    },
-    {
-      timezone,
-      scheduled: true,
-    }
-  );
-  activeTasks.push(morningJob);
-
-  // ============================================================
-  // JOB 2: MIDDAY POST
-  // ============================================================
-  const middayJob = cron.schedule(
-    hourToCron(middayHour),
-    async () => {
-      logger.info(`☀️ [SCHEDULER] Midday post triggered (${middayHour}:00 ${timezone})`);
-      await runScheduledPost('midday');
-    },
-    {
-      timezone,
-      scheduled: true,
-    }
-  );
-  activeTasks.push(middayJob);
-
-  // ============================================================
-  // JOB 3: EVENING POST
-  // ============================================================
-  const eveningJob = cron.schedule(
-    hourToCron(eveningHour),
-    async () => {
-      logger.info(`🌙 [SCHEDULER] Evening post triggered (${eveningHour}:00 ${timezone})`);
-      await runScheduledPost('evening');
-    },
-    {
-      timezone,
-      scheduled: true,
-    }
-  );
-  activeTasks.push(eveningJob);
-
-  logger.info(`✅ Scheduler active:`);
-  logger.info(`   🌅 Morning: ${morningHour}:00 ${timezone}`);
-  logger.info(`   ☀️ Midday:  ${middayHour}:00 ${timezone}`);
-  logger.info(`   🌙 Evening: ${eveningHour}:00 ${timezone}`);
-};
-
-/**
- * Run a scheduled post with error isolation
- * WHY: If a post fails, it should NOT crash the scheduler.
- * The scheduler must keep running for the next post.
- * @param {string} category
- */
-const runScheduledPost = async (category) => {
+const isValidTimezone = (timezone) => {
   try {
-    logger.info(`🎬 [SCHEDULER] Starting ${category} post pipeline...`);
-    const result = await runPostPipeline(category);
-    logger.info(`✅ [SCHEDULER] ${category} post completed. Status: ${result.status}`);
-  } catch (error) {
-    // CRITICAL: Never let errors propagate out of cron callbacks
-    // If they do, the cron library may stop the job silently
-    logger.error(`❌ [SCHEDULER] ${category} post failed`, {
-      error: error.message,
-      stack: error.stack,
+    Intl.DateTimeFormat(undefined, {
+      timeZone: timezone,
     });
-    // Post continues to run on next scheduled time
+
+    return true;
+  } catch {
+    return false;
   }
 };
 
 /**
- * Stop all cron jobs gracefully
- * Called during app shutdown (SIGTERM, SIGINT)
+ * Validate hour configuration
  */
+const validateHour = (hour, fieldName) => {
+  const parsedHour = Number(hour);
+
+  if (Number.isNaN(parsedHour) || parsedHour < 0 || parsedHour > 23) {
+    throw new Error(`[Scheduler] Invalid hour for "${fieldName}": ${hour}`);
+  }
+
+  return parsedHour;
+};
+
+/**
+ * Convert hour to cron expression
+ */
+const hourToCron = (hour) => {
+  return `0 ${hour} * * *`;
+};
+
+/**
+ * Promise timeout wrapper
+ */
+const withTimeout = async (promise, timeoutMs) => {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`Pipeline execution timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+// ============================================================
+// SCHEDULER INITIALIZATION
+// ============================================================
+
+export const initScheduler = () => {
+  // ------------------------------------------------------------
+  // Prevent duplicate initialization
+  // ------------------------------------------------------------
+
+  if (schedulerInitialized) {
+    logger.warn("[Scheduler] Already initialized");
+    return;
+  }
+
+  schedulerInitialized = true;
+
+  logger.info("[Scheduler] Initializing");
+
+  // ------------------------------------------------------------
+  // Extract and validate config
+  // ------------------------------------------------------------
+
+  const { morningHour, middayHour, eveningHour, timezone } = config.scheduler;
+
+  const verifiedTimezone = isValidTimezone(timezone) ? timezone : "UTC";
+
+  if (verifiedTimezone !== timezone) {
+    logger.warn(
+      `[Scheduler] Invalid timezone "${timezone}". Falling back to UTC`,
+    );
+  }
+
+  const schedules = [
+    {
+      name: "morning",
+      hour: validateHour(morningHour, "morningHour"),
+      icon: "🌅",
+    },
+    {
+      name: "midday",
+      hour: validateHour(middayHour, "middayHour"),
+      icon: "☀️",
+    },
+    {
+      name: "evening",
+      hour: validateHour(eveningHour, "eveningHour"),
+      icon: "🌙",
+    },
+  ];
+
+  // ------------------------------------------------------------
+  // Register cron jobs
+  // ------------------------------------------------------------
+
+  for (const schedule of schedules) {
+    const cronExpression = hourToCron(schedule.hour);
+
+    if (!cron.validate(cronExpression)) {
+      throw new Error(
+        `[Scheduler] Invalid cron expression generated: ${cronExpression}`,
+      );
+    }
+
+    const task = cron.schedule(
+      cronExpression,
+      async () => {
+        logger.info("[Scheduler] Trigger fired", {
+          category: schedule.name,
+          hour: schedule.hour,
+          timezone: verifiedTimezone,
+        });
+
+        await runScheduledPost(schedule.name);
+      },
+      {
+        timezone: verifiedTimezone,
+      },
+    );
+
+    activeTasks.push(task);
+
+    logger.info("[Scheduler] Task registered", {
+      category: schedule.name,
+      cron: cronExpression,
+      timezone: verifiedTimezone,
+    });
+  }
+
+  logger.info("[Scheduler] Ready");
+};
+
+// ============================================================
+// PIPELINE EXECUTION
+// ============================================================
+
+const runScheduledPost = async (category) => {
+  // ------------------------------------------------------------
+  // Prevent overlapping executions
+  // ------------------------------------------------------------
+
+  if (runningPipelines.has(category)) {
+    logger.warn("[Scheduler] Overlap prevented", {
+      category,
+    });
+
+    return;
+  }
+
+  runningPipelines.add(category);
+
+  logger.info("[Scheduler] Pipeline started", {
+    category,
+  });
+
+  try {
+    const result = await withTimeout(
+      runPostPipeline(category),
+      PIPELINE_TIMEOUT_MS,
+    );
+
+    logger.info("[Scheduler] Pipeline completed", {
+      category,
+      status: result?.status || "unknown",
+    });
+  } catch (error) {
+    logger.error("[Scheduler] Pipeline failed", {
+      category,
+      message: error.message,
+      stack: error.stack,
+    });
+  } finally {
+    runningPipelines.delete(category);
+
+    logger.info("[Scheduler] Pipeline lock released", {
+      category,
+    });
+  }
+};
+
+// ============================================================
+// SHUTDOWN HANDLER
+// ============================================================
+
 export const stopScheduler = () => {
-  logger.info('⏹️ Stopping scheduler...');
-  activeTasks.forEach(task => task.stop());
+  logger.info("[Scheduler] Stopping");
+
+  for (const [index, task] of activeTasks.entries()) {
+    try {
+      task.stop();
+
+      // Optional cleanup depending on node-cron version
+      if (typeof task.destroy === "function") {
+        task.destroy();
+      }
+
+      logger.info("[Scheduler] Task stopped", {
+        index,
+      });
+    } catch (error) {
+      logger.error("[Scheduler] Failed stopping task", {
+        index,
+        message: error.message,
+      });
+    }
+  }
+
   activeTasks.length = 0;
-  logger.info('✅ Scheduler stopped');
+  runningPipelines.clear();
+
+  schedulerInitialized = false;
+
+  logger.info("[Scheduler] Fully stopped");
 };

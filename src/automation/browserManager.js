@@ -1,154 +1,175 @@
 /**
  * src/automation/browserManager.js
  * ============================================================
- * PUPPETEER BROWSER MANAGER
- * ============================================================
- * WHY THIS IS ITS OWN MODULE:
- * Browser lifecycle (launch, reuse, close) is complex.
- * We want ONE shared browser instance — not a new browser
- * for every screenshot or Facebook post. Spawning a new
- * Chromium for every operation is:
- * - Slow (takes 3-5 seconds per launch)
- * - Memory-intensive (each browser = ~150MB RAM)
- * - Unnecessary if we can reuse the same instance
- *
- * WHY PUPPETEER-EXTRA + STEALTH PLUGIN:
- * Facebook uses JavaScript fingerprinting to detect bots.
- * The stealth plugin modifies Puppeteer's behavior to bypass
- * common bot detection checks:
- * - Removes the `navigator.webdriver = true` flag
- * - Randomizes canvas fingerprinting
- * - Fixes Chrome-specific properties that headless breaks
- * - Mimics a real browser more accurately
- *
- * WHY PERSISTENT USER DATA DIR (SESSION PERSISTENCE):
- * Without this, every browser launch starts fresh (no cookies,
- * no login state). With it, once logged into Facebook,
- * the session is saved to disk and reused on next launch.
- * This means: login ONCE manually, then the bot uses that session.
+ * PRODUCTION-GRADE BROWSER SINGLETON MANAGER
  * ============================================================
  */
 
-import puppeteerExtra from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import fs from 'fs-extra';
-import path from 'path';
-import { config } from '../config/index.js';
-import logger from '../utils/logger.js';
+import puppeteerExtra from "puppeteer-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
+import fs from "fs-extra";
+import path from "path";
+import { config } from "../config/index.js";
+import logger from "../utils/logger.js";
 
-// Apply the stealth plugin to puppeteer-extra
-// WHY: Must be done before launching any browser
 puppeteerExtra.use(StealthPlugin());
 
 // ============================================================
-// BROWSER SINGLETON
-// We maintain a single browser instance across the app lifetime.
-// WHY SINGLETON: Saves memory and startup time on Railway.
+// STATE
 // ============================================================
-let browserInstance = null;
 
-/**
- * Get or create the shared browser instance
- * @returns {Promise<Browser>} - Puppeteer browser object
- */
-export const getBrowser = async () => {
-  // If browser is already running and connected, reuse it
-  if (browserInstance && browserInstance.isConnected()) {
-    logger.debug('♻️ Reusing existing browser instance');
+let browserInstance = null;
+let launchingPromise = null;
+
+// ============================================================
+// SAFE LAUNCH LOCK
+// prevents race-condition double browser spawn
+// ============================================================
+
+const getBrowser = async () => {
+  // already healthy
+  if (browserInstance?.isConnected()) {
     return browserInstance;
   }
 
-  logger.info('🚀 Launching new Puppeteer browser...');
-  browserInstance = await launchBrowser();
-  logger.info('✅ Browser launched successfully');
-  return browserInstance;
+  // prevent concurrent launches
+  if (launchingPromise) {
+    return launchingPromise;
+  }
+
+  launchingPromise = launchBrowser();
+
+  try {
+    browserInstance = await launchingPromise;
+    return browserInstance;
+  } finally {
+    launchingPromise = null;
+  }
 };
 
-/**
- * Launch a new Puppeteer browser with Railway-compatible config
- * @returns {Promise<Browser>}
- */
+// ============================================================
+// LAUNCH BROWSER
+// ============================================================
+
 const launchBrowser = async () => {
-  // Ensure the session directory exists
+  logger.info("[Browser] Launching Chromium...");
+
   await fs.ensureDir(config.puppeteer.userDataDir);
 
-  return puppeteerExtra.launch({
-    headless: config.puppeteer.headless,
+  const browser = await puppeteerExtra.launch({
+    headless: config.puppeteer.headless ?? "new",
 
-    // WHERE SESSION DATA IS SAVED
-    // This is the magic that enables persistent login sessions.
-    // After logging into Facebook once, the cookies/localStorage
-    // are saved here and reused on every subsequent launch.
-    userDataDir: path.resolve(config.puppeteer.userDataDir),
+    userDataDir: path.resolve(
+      `${config.puppeteer.userDataDir}-${process.env.NODE_ENV || "prod"}`,
+    ),
 
-    // RAILWAY-COMPATIBLE ARGS
-    // Railway (and most CI/cloud environments) run without a display server.
-    // These flags configure Chromium to work in such environments:
     args: [
-      '--no-sandbox',              // Required in containerized environments
-      '--disable-setuid-sandbox',  // Additional sandbox bypass for containers
-      '--disable-dev-shm-usage',   // Use /tmp instead of /dev/shm (Railway has small /dev/shm)
-      '--disable-gpu',             // No GPU in server environments
-      '--no-first-run',            // Skip Chrome first-run wizard
-      '--no-zygote',               // Disable zygote process (more stable in containers)
-      '--disable-extensions',      // Faster startup
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-renderer-backgrounding',
-
-      // Viewport size — must match our image dimensions
-      '--window-size=1200,630',
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--no-first-run",
+      "--no-zygote",
+      "--disable-extensions",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--window-size=1200,630",
     ],
 
-    // Default viewport for all pages
     defaultViewport: {
       width: config.images.width,
       height: config.images.height,
     },
 
-    // How long to wait for browser launch (10 seconds)
-    timeout: 10000,
-
-    // Let puppeteer-extra handle the executable path
-    // (it auto-downloads Chromium if not found)
+    timeout: 20000,
   });
+
+  browser.on("disconnected", () => {
+    logger.warn("[Browser] Disconnected event triggered");
+    browserInstance = null;
+  });
+
+  logger.info("[Browser] Ready");
+  return browser;
 };
 
-/**
- * Open a new page in the shared browser
- * Each "task" (screenshot, Facebook post) should get its own page
- * and close it when done — to avoid memory leaks.
- * @returns {Promise<Page>} - Puppeteer page object
- */
+// ============================================================
+// PAGE CREATION WITH SAFETY LIMIT
+// ============================================================
+
 export const newPage = async () => {
   const browser = await getBrowser();
+
+  if (!browser?.isConnected()) {
+    throw new Error("[Browser] Browser not available");
+  }
+
   const page = await browser.newPage();
 
-  // Set a realistic user agent string
-  // WHY: Headless Chromium has a user agent that includes "HeadlessChrome"
-  // Facebook can detect this. We replace it with a real desktop UA.
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-  );
+  // Realistic UA rotation (lightweight anti-fingerprint)
+  const userAgents = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+  ];
 
-  // Set extra headers to look more like a real browser
+  const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
+
+  await page.setUserAgent(ua);
+
   await page.setExtraHTTPHeaders({
-    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
   });
+
+  // HARDEN: avoid silent hangs
+  page.setDefaultNavigationTimeout(45000);
+  page.setDefaultTimeout(30000);
 
   return page;
 };
 
-/**
- * Close the browser and reset the singleton
- * Called during graceful shutdown
- */
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
+export const isBrowserHealthy = () => {
+  return !!browserInstance?.isConnected();
+};
+
+// ============================================================
+// FORCE RECOVERY
+// ============================================================
+
+export const restartBrowser = async () => {
+  logger.warn("[Browser] Restarting browser manually...");
+
+  try {
+    await browserInstance?.close?.();
+  } catch {}
+
+  browserInstance = null;
+  launchingPromise = null;
+
+  await getBrowser();
+};
+
+// ============================================================
+// SHUTDOWN
+// ============================================================
+
 export const closeBrowser = async () => {
-  if (browserInstance) {
-    logger.info('🔌 Closing browser...');
-    await browserInstance.close().catch(() => {});
-    browserInstance = null;
-    logger.info('✅ Browser closed');
+  if (!browserInstance) return;
+
+  logger.info("[Browser] Closing...");
+
+  try {
+    await browserInstance.close();
+  } catch (e) {
+    logger.error("[Browser] Close error", { message: e.message });
   }
+
+  browserInstance = null;
+  launchingPromise = null;
+
+  logger.info("[Browser] Closed");
 };

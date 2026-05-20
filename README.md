@@ -83,20 +83,20 @@ Cron Job (8h / 12h / 19h)
 
 ### 🎨 Les 5 Layouts Visuels
 
-| Layout | Catégorie | Style |
-|--------|-----------|-------|
-| `morning-glow` | Matin | Gradient violet-orange, énergie explosive |
-| `tech-grid` | Midi | Dark tech, ambiance terminal/code |
-| `cta-blast` | Soir | CTA centré, conversion maximale |
-| `quote-card` | Flexible | Citation minimaliste, élégant |
-| `academy-banner` | Institutionnel | Split layout, branding G-tech |
+| Layout           | Catégorie      | Style                                     |
+| ---------------- | -------------- | ----------------------------------------- |
+| `morning-glow`   | Matin          | Gradient violet-orange, énergie explosive |
+| `tech-grid`      | Midi           | Dark tech, ambiance terminal/code         |
+| `cta-blast`      | Soir           | CTA centré, conversion maximale           |
+| `quote-card`     | Flexible       | Citation minimaliste, élégant             |
+| `academy-banner` | Institutionnel | Split layout, branding G-tech             |
 
 ### ⏰ Stratégie de publication
 
-| Heure | Catégorie | Contenu |
-|-------|-----------|---------|
-| 08:00 | `morning` | Motivation entrepreneuriale, mindset |
-| 12:00 | `midday` | Tech, code, carrière, conseils pratiques |
+| Heure | Catégorie | Contenu                                     |
+| ----- | --------- | ------------------------------------------- |
+| 08:00 | `morning` | Motivation entrepreneuriale, mindset        |
+| 12:00 | `midday`  | Tech, code, carrière, conseils pratiques    |
 | 19:00 | `evening` | CTA G-tech-academy, rejoindre la communauté |
 
 ---
@@ -146,6 +146,7 @@ Railway est une plateforme cloud simple qui exécute des apps Node.js sans confi
 6. Le bot démarre et tourne 24/7
 
 **Variables Railway obligatoires :**
+
 ```
 MONGODB_URI
 OPENROUTER_API_KEY
@@ -195,6 +196,7 @@ NODE_ENV=production
 ```bash
 npm run setup-session
 ```
+
 - Un navigateur s'ouvre
 - Connecte-toi manuellement à Facebook
 - Navigue vers ta page G-tech-academy
@@ -205,14 +207,15 @@ npm run setup-session
 
 ### 📡 Endpoints API
 
-| Méthode | Route | Description |
-|---------|-------|-------------|
-| `GET` | `/health` | Status du serveur |
-| `POST` | `/api/trigger-post` | Déclencher un post manuellement |
-| `GET` | `/api/posts` | Historique des posts |
-| `GET` | `/api/analytics` | Analytics du jour + global |
+| Méthode | Route               | Description                     |
+| ------- | ------------------- | ------------------------------- |
+| `GET`   | `/health`           | Status du serveur               |
+| `POST`  | `/api/trigger-post` | Déclencher un post manuellement |
+| `GET`   | `/api/posts`        | Historique des posts            |
+| `GET`   | `/api/analytics`    | Analytics du jour + global      |
 
 **Exemple :**
+
 ```bash
 # Déclencher un post matin manuellement
 curl -X POST http://localhost:3000/api/trigger-post \
@@ -226,12 +229,12 @@ curl -X POST http://localhost:3000/api/trigger-post \
 
 Les logs sont gérés par **Winston** et stockés dans `src/logs/` :
 
-| Fichier | Contenu |
-|---------|---------|
-| `app.log` | Tous les événements (info, warn, error) |
-| `error.log` | Erreurs uniquement (plus facile à surveiller) |
-| `exceptions.log` | Exceptions non gérées |
-| `rejections.log` | Promesses rejetées non gérées |
+| Fichier          | Contenu                                       |
+| ---------------- | --------------------------------------------- |
+| `app.log`        | Tous les événements (info, warn, error)       |
+| `error.log`      | Erreurs uniquement (plus facile à surveiller) |
+| `exceptions.log` | Exceptions non gérées                         |
+| `rejections.log` | Promesses rejetées non gérées                 |
 
 ---
 
@@ -300,15 +303,15 @@ npm run trigger evening
 
 ### 🏛️ Architecture Principles
 
-| Principle | Implementation |
-|-----------|----------------|
+| Principle              | Implementation                                        |
+| ---------------------- | ----------------------------------------------------- |
 | Separation of concerns | controllers / services / models / routes are separate |
-| Single responsibility | Each file does ONE thing |
-| Fail gracefully | Every cron error is caught — scheduler never dies |
-| Hybrid publishing | Graph API primary → Puppeteer fallback |
-| Session persistence | Login once, reuse session for months |
-| Centralized config | All env vars validated at startup |
-| Structured logging | Winston with rotation and log levels |
+| Single responsibility  | Each file does ONE thing                              |
+| Fail gracefully        | Every cron error is caught — scheduler never dies     |
+| Hybrid publishing      | Graph API primary → Puppeteer fallback                |
+| Session persistence    | Login once, reuse session for months                  |
+| Centralized config     | All env vars validated at startup                     |
+| Structured logging     | Winston with rotation and log levels                  |
 
 ### 🔑 Key Commands
 
@@ -327,6 +330,7 @@ MIT — Billy Doumbouya · G-tech-academy · 2024
 
 ---
 
-*Built with ❤️ for African tech entrepreneurship 🌍*
-#   g - t e c h - m e d i a b o t  
+_Built with ❤️ for African tech entrepreneurship 🌍_
+#   g - t e c h - m e d i a b o t 
+ 
  
