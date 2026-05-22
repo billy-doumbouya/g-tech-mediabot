@@ -1,7 +1,7 @@
 /**
  * src/automation/browserManager.js
  * ============================================================
- * PRODUCTION-GRADE BROWSER SINGLETON MANAGER
+ * PRODUCTION-GRADE BROWSER SINGLETON MANAGER (CORRIGÉ NATIVE API)
  * ============================================================
  */
 
@@ -14,25 +14,18 @@ import logger from "../utils/logger.js";
 
 puppeteerExtra.use(StealthPlugin());
 
-// ============================================================
-// STATE
-// ============================================================
-
 let browserInstance = null;
 let launchingPromise = null;
 
-// ============================================================
-// SAFE LAUNCH LOCK
-// prevents race-condition double browser spawn
-// ============================================================
+const FIXED_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const getBrowser = async () => {
-  // already healthy
-  if (browserInstance?.isConnected()) {
+  // CORRECTION 1 : Propriété native (pas de parenthèses)
+  if (browserInstance?.connected) {
     return browserInstance;
   }
 
-  // prevent concurrent launches
   if (launchingPromise) {
     return launchingPromise;
   }
@@ -47,42 +40,34 @@ const getBrowser = async () => {
   }
 };
 
-// ============================================================
-// LAUNCH BROWSER
-// ============================================================
-
 const launchBrowser = async () => {
   logger.info("[Browser] Launching Chromium...");
 
-  await fs.ensureDir(config.puppeteer.userDataDir);
+  // FORCE LE CHEMIN EXACT : On utilise directement le dossier "browser-session"
+  // au lieu de rajouter "-prod" ou "-dev" qui casse la synchronisation
+  const storagePath = path.resolve("./browser-session");
+  await fs.ensureDir(storagePath);
 
   const browser = await puppeteerExtra.launch({
-    headless: config.puppeteer.headless ?? "new",
-
-    userDataDir: path.resolve(
-      `${config.puppeteer.userDataDir}-${process.env.NODE_ENV || "prod"}`,
-    ),
+    // Assure-toi que c'est bien à "shell" ou true pour l'automatisation
+    headless: config.puppeteer.headless ?? "shell",
+    userDataDir: storagePath,
 
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--no-first-run",
-      "--no-zygote",
-      "--disable-extensions",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
       "--window-size=1200,630",
+      "--lang=fr-FR,fr",
     ],
 
     defaultViewport: {
-      width: config.images.width,
-      height: config.images.height,
+      width: config.images.width || 1200,
+      height: config.images.height || 630,
     },
 
-    timeout: 20000,
+    timeout: 30000,
   });
 
   browser.on("disconnected", () => {
@@ -94,82 +79,52 @@ const launchBrowser = async () => {
   return browser;
 };
 
-// ============================================================
-// PAGE CREATION WITH SAFETY LIMIT
-// ============================================================
-
 export const newPage = async () => {
   const browser = await getBrowser();
 
-  if (!browser?.isConnected()) {
+  // CORRECTION 2 : Propriété native (pas de parenthèses)
+  if (!browser?.connected) {
     throw new Error("[Browser] Browser not available");
   }
 
   const page = await browser.newPage();
 
-  // Realistic UA rotation (lightweight anti-fingerprint)
-  const userAgents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
-  ];
-
-  const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
-
-  await page.setUserAgent(ua);
+  await page.setUserAgent(FIXED_USER_AGENT);
 
   await page.setExtraHTTPHeaders({
-    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8,en-US;q=0.7",
   });
 
-  // HARDEN: avoid silent hangs
   page.setDefaultNavigationTimeout(45000);
   page.setDefaultTimeout(30000);
 
   return page;
 };
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-
 export const isBrowserHealthy = () => {
-  return !!browserInstance?.isConnected();
+  // CORRECTION 3 : Nettoyage final de la méthode obsolète
+  return !!browserInstance?.connected;
 };
-
-// ============================================================
-// FORCE RECOVERY
-// ============================================================
 
 export const restartBrowser = async () => {
   logger.warn("[Browser] Restarting browser manually...");
-
   try {
     await browserInstance?.close?.();
   } catch {}
-
   browserInstance = null;
   launchingPromise = null;
-
   await getBrowser();
 };
 
-// ============================================================
-// SHUTDOWN
-// ============================================================
-
 export const closeBrowser = async () => {
   if (!browserInstance) return;
-
   logger.info("[Browser] Closing...");
-
   try {
     await browserInstance.close();
   } catch (e) {
     logger.error("[Browser] Close error", { message: e.message });
   }
-
   browserInstance = null;
   launchingPromise = null;
-
   logger.info("[Browser] Closed");
 };

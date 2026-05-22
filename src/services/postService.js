@@ -1,7 +1,7 @@
 /**
  * src/services/postService.js
  * ============================================================
- * PRODUCTION-READY POST SERVICE — CORE BUSINESS LOGIC PIPELINE
+ * PRODUCTION-READY POST SERVICE — CORE BUSINESS LOGIC PIPELINE (CORRIGÉ)
  * ============================================================
  */
 
@@ -17,6 +17,7 @@ import { publishViaPuppeteer } from "../automation/facebookPuppeteer.js";
 import Post from "../models/Post.js";
 import Analytics from "../models/Analytics.js";
 import logger from "../utils/logger.js";
+import fs from "fs-extra"; // Ajouté pour le nettoyage du disque
 
 /**
  * MAIN PIPELINE: Run the complete post creation and publishing flow
@@ -27,9 +28,6 @@ export const runPostPipeline = async (category) => {
   const postId = uuidv4();
   logger.info(`🎬 Starting post pipeline [${category}] — ID: ${postId}`);
 
-  // PRODUCTION FIX: Persist an entry in the database immediately without full validation.
-  // This guarantees that if OpenRouter, Puppeteer, or your server crashes at any step,
-  // we still have a clean audit record of the 'failed' post instance.
   const postInstance = new Post({
     uuid: postId,
     category,
@@ -37,6 +35,7 @@ export const runPostPipeline = async (category) => {
     publishAttempts: 0,
   });
 
+  // Persistance initiale immédiate pour l'audit de crash
   await postInstance.save({ validateBeforeSave: false });
   await Analytics.increment("postsGenerated").catch(() => {});
 
@@ -54,7 +53,6 @@ export const runPostPipeline = async (category) => {
     const aiContent = await generateContent(category);
     await Analytics.increment("aiCallsTotal").catch(() => {});
 
-    // Hydrate the model record safely mid-flight
     postInstance.aiContent = { ...aiContent, model: "openrouter" };
     logger.info(`✅ AI content engine completed: "${aiContent.title}"`);
 
@@ -62,8 +60,8 @@ export const runPostPipeline = async (category) => {
     // STEP 2: SELECT LAYOUT
     // ============================================================
     logger.info("🎨 Step 2/5: Distributing visual layout templates...");
-    const suggestedLayouts = suggestLayouts(category);
-    const templateName = suggestedLayouts[0] || "default";
+    const suggestedLayoutsList = suggestLayouts(category);
+    const templateName = suggestedLayoutsList[0] || "default";
     postInstance.templateName = templateName;
     logger.info(`✅ Layout successfully chosen: ${templateName}`);
 
@@ -81,31 +79,36 @@ export const runPostPipeline = async (category) => {
     logger.info("📸 Step 4/5: Running background capture worker...");
     imagePath = await generateImage(html, postId);
     postInstance.imagePath = imagePath;
-    // NOTE: Removed the redundant Analytics increment here because screenshotGenerator logs it cleanly.
 
     // ============================================================
     // STEP 5: BUILD CAPTION
     // ============================================================
     caption = buildCaption(aiContent);
-    await postInstance.save(); // Checkpoint tracking update to capture artifacts prior to network calls
+
+    // Checkpoint intermédiaire indispensable avant d'attaquer le réseau
+    await postInstance.save();
 
     // ============================================================
-    // STEP 6: HYBRID HYBRID PUBLISHING (Graph API → Puppeteer)
+    // STEP 6: HYBRID PUBLISHING (Graph API → Puppeteer)
     // ============================================================
     logger.info("📤 Step 5/5: Executing hybrid publication network layers...");
 
-    // --- PRIMARY STRATEGY: Graph API ---
+    // --- STRATÉGIE PRIMAIRE : Graph API ---
     if (isGraphAPIConfigured()) {
       try {
         postInstance.publishAttempts++;
+        // Sauvegarde immédiate du compteur de tentative pour l'historique
+        await postInstance.save();
+
         facebookPostId = await publishViaGraphAPI(imagePath, caption);
         publishedVia = "graph_api";
+
         await Analytics.increment("graphApiSuccess").catch(() => {});
         logger.info(
           "✅ API handshake success! Dispatched via Facebook Graph API.",
         );
       } catch (graphError) {
-        publishError = graphError.message;
+        publishError = `[Graph API Error]: ${graphError.message}`;
         logger.warn(
           `⚠️ Graph API layer dropped connection: ${graphError.message}. Initiating Puppeteer recovery fallback...`,
         );
@@ -116,18 +119,21 @@ export const runPostPipeline = async (category) => {
       );
     }
 
-    // --- FALLBACK STRATEGY: Puppeteer Automation ---
+    // --- STRATÉGIE DE SECOURS : Puppeteer Automation ---
     if (!publishedVia) {
       try {
         postInstance.publishAttempts++;
+        await postInstance.save(); // Sauvegarde de la deuxième tentative
+
         facebookPostId = await publishViaPuppeteer(imagePath, caption);
         publishedVia = "puppeteer";
+
         await Analytics.increment("puppeteerFallbackUsed").catch(() => {});
         logger.info(
           "✅ Automation engine success! Dispatched via Puppeteer background browser instance.",
         );
       } catch (pupError) {
-        publishError = `[Graph API Exception]: ${publishError || "Unattempted"} | [Puppeteer Exception]: ${pupError.message}`;
+        publishError = `${publishError || "Unattempted"} | [Puppeteer Error]: ${pupError.message}`;
         logger.error(
           "❌ Critical Pipeline Failure: Both network broadcast layers aborted execution parameters.",
           { error: publishError },
@@ -157,7 +163,6 @@ export const runPostPipeline = async (category) => {
     );
     return postInstance.toObject();
   } catch (criticalPipelineError) {
-    // Catch-all block ensures that even if an internal JSON parsing errors crashes your script, the database record updates to failed status
     logger.error(
       "❌ Severe exception interrupted post pipeline orchestration workflow:",
       { message: criticalPipelineError.message },
@@ -165,6 +170,7 @@ export const runPostPipeline = async (category) => {
 
     postInstance.status = "failed";
     postInstance.errorMessage = `[Critical Core System Pipeline Crash]: ${criticalPipelineError.message}`;
+
     await postInstance
       .save()
       .catch((dbErr) =>
@@ -176,14 +182,26 @@ export const runPostPipeline = async (category) => {
 
     await Analytics.increment("postsFailed").catch(() => {});
     throw criticalPipelineError;
+  } finally {
+    // NETTOYAGE CRITIQUE DU DISQUE DUR :
+    // Une fois l'image téléversée ou le processus planté, on supprime le PNG local
+    // pour éviter de saturer l'espace disque du serveur de production.
+    if (imagePath) {
+      fs.remove(imagePath)
+        .then(() =>
+          logger.debug(
+            `🧹 Local asset artifact garbage collected: ${imagePath}`,
+          ),
+        )
+        .catch((err) =>
+          logger.warn(
+            `⚠️ Failed to remove temporary asset image file: ${err.message}`,
+          ),
+        );
+    }
   }
 };
 
-/**
- * Build the full Facebook post caption from AI content securely
- * @param {Object} aiContent
- * @returns {string}
- */
 const buildCaption = (aiContent) => {
   if (!aiContent) return "";
   const parts = [
@@ -199,11 +217,6 @@ const buildCaption = (aiContent) => {
     .trim();
 };
 
-/**
- * Get recent posts for the analytics/logs API endpoint safely structured
- * @param {number} limit - Max number of posts to return
- * @returns {Promise<Array>}
- */
 export const getRecentPosts = async (limit = 20) => {
   try {
     return await Post.find().sort({ createdAt: -1 }).limit(limit).lean();
@@ -213,10 +226,6 @@ export const getRecentPosts = async (limit = 20) => {
   }
 };
 
-/**
- * Get today's analytics summary smoothly structured
- * @returns {Promise<Object>}
- */
 export const getTodayAnalytics = async () => {
   try {
     const today = new Date().toISOString().split("T")[0];

@@ -1,27 +1,16 @@
 /**
  * src/utils/asyncWrapper.js
  * ============================================================
- * ASYNC ERROR WRAPPER UTILITY
- * ============================================================
- * WHY THIS EXISTS:
- * In Express, if an async function throws an error and you don't
- * catch it, the server hangs forever. Wrapping every route handler
- * in try/catch is repetitive and messy.
- *
- * This utility wraps any async function and automatically passes
- * errors to Express's next() error handler.
- *
- * USAGE:
- *   router.get('/route', asyncWrapper(async (req, res) => {
- *     const data = await someAsyncOperation();
- *     res.json(data);
- *   }));
+ * ASYNC ERROR WRAPPER & RESILIENCE UTILITIES (CORRIGÉ)
  * ============================================================
  */
 
+import logger from "./logger.js"; // On centralise sur ton logger custom plutôt que console.warn
+
 /**
- * Wraps an async Express route handler to catch errors automatically
- * @param {Function} fn - Async route handler
+ * Wraps an async Express route handler to catch errors automatically.
+ * Essential for Express 4.x applications to prevent unhandled rejections from hanging.
+ * @param {Function} fn - Async route handler (req, res, next)
  * @returns {Function} - Wrapped handler that catches errors
  */
 export const asyncWrapper = (fn) => {
@@ -31,36 +20,57 @@ export const asyncWrapper = (fn) => {
 };
 
 /**
- * Retry a function N times with delay between attempts
- * WHY: Network calls (AI API, Facebook Graph API) can fail transiently.
- * Retrying gives us resilience without crashing the whole pipeline.
+ * Retry a function N times with an incremental backoff delay between attempts.
+ * Preserves the original semantic stack traces for modern cloud logging platforms.
  *
  * @param {Function} fn - The async function to retry
  * @param {number} maxRetries - Maximum retry attempts
- * @param {number} delayMs - Milliseconds to wait between retries
- * @param {string} label - Label for logging
+ * @param {number} delayMs - Base milliseconds to wait between retries
+ * @param {string} label - Label for context logging
+ * @returns {Promise<*>} - The resolved result of the passed function
  */
-export const withRetry = async (fn, maxRetries = 3, delayMs = 2000, label = 'operation') => {
-  let lastError;
+export const withRetry = async (
+  fn,
+  maxRetries = 3,
+  delayMs = 2000,
+  label = "operation",
+) => {
+  let lastError = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (error) {
       lastError = error;
-      console.warn(`⚠️ [${label}] Attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+
+      logger.warn(
+        `⚠️ [${label}] Attempt ${attempt}/${maxRetries} failed. Retrying...`,
+        {
+          message: error.message,
+          stack: error.stack,
+        },
+      );
 
       if (attempt < maxRetries) {
-        await sleep(delayMs * attempt); // Exponential-ish backoff
+        // Backoff incrémentiel linéaire : 2s, puis 4s, puis 6s...
+        await sleep(delayMs * attempt);
       }
     }
   }
 
-  throw new Error(`[${label}] Failed after ${maxRetries} attempts. Last error: ${lastError.message}`);
+  // PRODUCTION FIX: On lève une erreur explicite TOUT EN préservant
+  // la structure native et la stack trace de l'erreur d'origine grâce à "cause".
+  const failureError = new Error(
+    `[${label}] Orchestrator pipeline aborted after ${maxRetries} sequential attempts.`,
+  );
+
+  failureError.cause = lastError;
+  throw failureError;
 };
 
 /**
- * Simple sleep/delay utility
+ * Simple execution thread sleep/delay utility
  * @param {number} ms - Milliseconds to wait
+ * @returns {Promise<void>}
  */
-export const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

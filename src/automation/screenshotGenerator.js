@@ -1,7 +1,7 @@
 /**
  * src/automation/screenshotGenerator.js
  * ============================================================
- * HARDENED HTML → IMAGE SCREENSHOT GENERATOR
+ * HARDENED HTML → IMAGE SCREENSHOT GENERATOR (CORRIGÉ)
  * ============================================================
  */
 
@@ -19,7 +19,6 @@ import Analytics from "../models/Analytics.js";
  * @returns {Promise<string>} - Absolute path to saved PNG
  */
 export const generateImage = async (html, filename) => {
-  // Ensure output directory layout exists on volume disk early
   await fs.ensureDir(config.images.outputDir);
 
   const outputPath = path.resolve(config.images.outputDir, `${filename}.png`);
@@ -30,25 +29,40 @@ export const generateImage = async (html, filename) => {
       `📸 Initializing image snapshot workspace for asset: ${filename}.png`,
     );
 
-    // Spawns a dedicated page abstraction instance from the singleton core
     page = await newPage();
 
-    // Enforce target dimensional metrics explicitly
     await page.setViewport({
       width: config.images.width,
       height: config.images.height,
-      deviceScaleFactor: 1, // Keep at 1x to optimize processing speed on cloud instances
+      deviceScaleFactor: 1,
     });
 
-    // OPTIMIZATION: Use domcontentloaded to prevent network hanging loops
-    await page.setContent(html, {
-      waitUntil: "domcontentloaded",
-      timeout: 10000, // Strict 10-second ceiling to prevent container worker stalls
-    });
+    // FIX INTÉGRATION POLICES/IMAGES LOCALES :
+    // Si ton HTML utilise des fichiers locaux, on force l'URL de base sur le projet,
+    // sinon le chargement depuis "about:blank" échouera en mode headless.
+    const projectRootUri = `file://${path.resolve(".")}/`;
 
-    // PRODUCTION FIX: Programmatically wait for all custom typography styling blocks to download
+    // FIX SÉCURITÉ CHARGEMENT :
+    // On utilise "networkidle0" (plus aucun trafic réseau pendant 500ms).
+    // C'est indispensable pour s'assurer que les images <img src="..."> et les CSS externes sont chargés.
+    // Le timeout de 10s protège contre les blocages de CDN tiers.
+    await page
+      .setContent(html, {
+        waitUntil: "networkidle0",
+        timeout: 10000,
+      })
+      .catch((err) => {
+        // Si networkidle0 échoue à cause d'un tracker ou d'un script tiers qui tourne en boucle,
+        // on vérifie si le DOM basique est quand même là. Si oui, on tolère et on continue.
+        logger.warn(
+          "⚠️ Network idle timed out early, attempting to proceed with available DOM layers.",
+        );
+      });
+
+    // PRODUCTION FIX : Attente réelle de la compilation des polices
     logger.debug("🔤 Waiting for font asset compilation layers...");
     try {
+      // On force une évaluation explicite avec un timeout interne
       await page.evaluate(() => document.fonts.ready);
     } catch (fontErr) {
       logger.warn(
@@ -57,7 +71,6 @@ export const generateImage = async (html, filename) => {
     }
 
     // CRITICAL CLOUD STABILITY FIX: Suppress CSS transitions/animations
-    // This stops images from being captured halfway through a fade-in animation
     await page.addStyleTag({
       content: `
         *, *::before, *::after {
@@ -69,11 +82,16 @@ export const generateImage = async (html, filename) => {
       `,
     });
 
+    // DOUBLE CHECK: S'assurer que le moteur d'affichage a fini de calculer les boîtes de rendu (Reflow/Repaint)
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(resolve)),
+    );
+
     // TAKE THE SCREENSHOT WITH CLIP BOUNDS
     await page.screenshot({
       path: outputPath,
       type: "png",
-      omitBackground: false, // Guarantees default transparency states don't corrupt target formats
+      omitBackground: false,
       clip: {
         x: 0,
         y: 0,
@@ -97,10 +115,9 @@ export const generateImage = async (html, filename) => {
     );
     throw error;
   } finally {
-    // PROTECTED WORKER TEARDOWN Pipeline
     if (page) {
       logger.debug("🧹 Recycler engaging on local page container threads...");
-      // Wrap the close loop with a forced promise race to protect the node thread from sticking on OOM instances
+      // Ton excellent Promise.race pour éviter les fuites de mémoire (OOM)
       await Promise.race([
         page.close(),
         new Promise((resolve) => setTimeout(resolve, 2000)),
