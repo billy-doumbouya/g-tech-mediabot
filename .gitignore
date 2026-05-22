@@ -22,3 +22,32 @@ Thumbs.db
 
 # Puppeteer cache
 .local-chromium/
+# Browser sessions
+browser-session-development/
+browser-session/
+
+# Chromium
+Default/
+Cache/
+Code Cache/
+GPUCache/
+Service Worker/
+Sessions/
+
+# Logs
+*.log
+LOG
+LOG.old
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Node
+node_modules/
+
+# Debug
+generated-images/
