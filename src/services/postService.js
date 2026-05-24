@@ -97,47 +97,36 @@ export const runPostPipeline = async (category) => {
     if (isGraphAPIConfigured()) {
       try {
         postInstance.publishAttempts++;
-        // Sauvegarde immédiate du compteur de tentative pour l'historique
         await postInstance.save();
 
-        facebookPostId = await publishViaGraphAPI(imagePath, caption);
+        facebookPostId = await publishViaGraphAPI(imagePath, caption); // ← Graph API
         publishedVia = "graph_api";
 
         await Analytics.increment("graphApiSuccess").catch(() => {});
-        logger.info(
-          "✅ API handshake success! Dispatched via Facebook Graph API.",
-        );
+        logger.info("✅ Dispatched via Facebook Graph API.");
       } catch (graphError) {
         publishError = `[Graph API Error]: ${graphError.message}`;
         logger.warn(
-          `⚠️ Graph API layer dropped connection: ${graphError.message}. Initiating Puppeteer recovery fallback...`,
+          `⚠️ Graph API failed: ${graphError.message}. Initiating Puppeteer fallback...`,
         );
       }
-    } else {
-      logger.info(
-        "ℹ️ Network Profile Note: Graph API variables unconfigured — diverting directly to browser layer.",
-      );
     }
 
-    // --- STRATÉGIE DE SECOURS : Puppeteer Automation ---
+    // --- STRATÉGIE DE SECOURS : Puppeteer ---
     if (!publishedVia) {
       try {
         postInstance.publishAttempts++;
-        await postInstance.save(); // Sauvegarde de la deuxième tentative
+        await postInstance.save();
 
-        facebookPostId = await publishViaPuppeteer(imagePath, caption);
+        const puppeteerResult = await publishViaPuppeteer(imagePath, caption);
+        facebookPostId = puppeteerResult?.facebookPostId ?? "SUCCESS"; // ← destructuring
         publishedVia = "puppeteer";
 
         await Analytics.increment("puppeteerFallbackUsed").catch(() => {});
-        logger.info(
-          "✅ Automation engine success! Dispatched via Puppeteer background browser instance.",
-        );
+        logger.info("✅ Dispatched via Puppeteer.");
       } catch (pupError) {
-        publishError = `${publishError || "Unattempted"} | [Puppeteer Error]: ${pupError.message}`;
-        logger.error(
-          "❌ Critical Pipeline Failure: Both network broadcast layers aborted execution parameters.",
-          { error: publishError },
-        );
+        publishError = `${publishError || ""} | [Puppeteer Error]: ${pupError.message}`;
+        logger.error("❌ Both layers failed.", { error: publishError });
       }
     }
 

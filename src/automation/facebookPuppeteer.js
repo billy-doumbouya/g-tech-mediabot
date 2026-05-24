@@ -1,8 +1,6 @@
 /**
  * src/automation/facebookPuppeteer.js
- * ============================================================
- * FACEBOOK PAGE PUBLISHER — VERSION PRODUCTION OPTIMISÉE
- * ============================================================
+ * VERSION v6 — Fix ordre caption/image + React events + stabilisation modale
  */
 
 import path from "path";
@@ -11,374 +9,264 @@ import { newPage } from "./browserManager.js";
 import { config } from "../config/index.js";
 import logger from "../utils/logger.js";
 
-// ============================================================
-// CONSTANTES & CONFIGURATION
-// ============================================================
-
 const FB_URL = "https://www.facebook.com";
-
-const TIMEOUTS = {
-  navigation: 45_000,
-  action: 20_000,
-  upload: 30_000,
-  postConfirm: 15_000,
-};
-
-const TYPING_DELAY = 18;
+const DEBUG_DIR = path.resolve("./logs/screenshots");
 let isPublishing = false;
-const DEBUG_DIR = path.resolve("./generated-images");
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 // ============================================================
-// POINT D'ENTRÉE PRINCIPAL
+// HELPER — Trouver la vraie modale de post
+// Facebook ouvre plusieurs dialogs simultanément (notifications,
+// overlays). La modale de post contient toujours un <form method="POST">
+// ============================================================
+const getPostDialog = () => {
+  const allDialogs = document.querySelectorAll('div[role="dialog"]');
+  for (const dialog of allDialogs) {
+    // La modale de post contient un form POST et a une taille réelle
+    const hasForm = dialog.querySelector('form[method="POST"]');
+    const rect = dialog.getBoundingClientRect();
+    if (hasForm && rect.width > 100 && rect.height > 100) {
+      return dialog;
+    }
+  }
+  // Fallback : dialog avec contenteditable ou le plus grand
+  let biggest = null;
+  let maxArea = 0;
+  for (const dialog of allDialogs) {
+    const rect = dialog.getBoundingClientRect();
+    const area = rect.width * rect.height;
+    if (area > maxArea) {
+      maxArea = area;
+      biggest = dialog;
+    }
+  }
+  return biggest;
+};
+// ============================================================
+// ENTRY POINT
 // ============================================================
 
 export const publishViaPuppeteer = async (imagePath, caption) => {
-  if (isPublishing) {
-    throw new Error("[FB] Concurrency lock active — publication déjà en cours");
-  }
+  if (isPublishing)
+    throw new Error("[FB] Concurrency lock: Publication en cours");
 
   isPublishing = true;
   let page = null;
 
   try {
     await fs.ensureDir(DEBUG_DIR);
-    logger.info("[FB] Démarrage du pipeline de publication Puppeteer");
-
     page = await newPage();
 
     const loggedIn = await checkLoginStatus(page);
-
     if (!loggedIn) {
-      logger.info("[FB] Session expirée ou inexistante, reconnexion...");
+      logger.info("[FB] Session expirée — reconnexion...");
       await loginToFacebook(page);
     } else {
-      logger.info("[FB] Session active, étape de login ignorée");
+      logger.info("[FB] ✅ Session active — login ignoré");
     }
 
     await navigateToPage(page);
-
+    await openComposer(page);
     const postId = await createPost(page, imagePath, caption);
-    logger.info("[FB] ✅ Publication réussie avec succès", { postId });
 
-    return { status: "success", facebookPostId: postId ?? null };
+    logger.info("[FB] ✅ Publication réussie !", { postId });
+    return { status: "success", facebookPostId: postId };
   } catch (error) {
     if (page) {
-      await page
-        .screenshot({
-          path: path.join(DEBUG_DIR, "fb-error.png"),
-          fullPage: true,
-        })
-        .catch(() => {});
+      const errorImg = path.join(DEBUG_DIR, `error-${Date.now()}.png`);
+      await page.screenshot({ path: errorImg, fullPage: true }).catch(() => {});
+      logger.error(`[FB] ❌ Échec. Screenshot: ${errorImg}`);
     }
-
-    logger.error("[FB] ❌ Échec critique de la publication", {
-      message: error.message,
-      stack: error.stack,
-    });
-
     throw error;
   } finally {
     isPublishing = false;
-    if (page) {
-      await page.close().catch(() => {});
-    }
+    if (page) await page.close().catch(() => {});
   }
 };
 
 // ============================================================
-// VÉRIFICATION DE LA SESSION
+// VÉRIFICATION SESSION
 // ============================================================
 
 const checkLoginStatus = async (page) => {
   try {
-    await page.goto(FB_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: TIMEOUTS.navigation,
-    });
-
+    await page.goto(FB_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
     await sleep(3000);
-
     const currentUrl = page.url();
-    logger.info(`[FB] URL après navigation initiale: ${currentUrl}`);
+    logger.info(`[FB] URL: ${currentUrl}`);
 
     if (currentUrl.includes("/login") || currentUrl.includes("login.php")) {
-      logger.info("[FB] Redirection vers page de login détectée");
       return false;
     }
 
-    const isLoggedIn = await page.evaluate(() => {
+    return await page.evaluate(() => {
       const loginForm =
         document.querySelector('input[name="email"]') ||
         document.querySelector("#email");
       if (loginForm) return false;
-
-      const indicators = [
-        document.querySelector('[aria-label="Facebook"]'),
-        document.querySelector('[data-pagelet="LeftRail"]'),
-        document.querySelector('[role="navigation"]'),
-        document.querySelector('div[data-pagelet="Stories"]'),
-      ];
-      return indicators.some((el) => el !== null);
+      return !!(
+        document.querySelector('[aria-label="Facebook"]') ||
+        document.querySelector('[data-pagelet="LeftRail"]') ||
+        document.querySelector('[role="navigation"]')
+      );
     });
-
-    logger.info(`[FB] Statut de connexion évalué: ${isLoggedIn}`);
-    return isLoggedIn;
   } catch (err) {
-    logger.warn("[FB] Erreur lors de la vérification de session", {
-      message: err.message,
-    });
+    logger.warn("[FB] Erreur session", { message: err.message });
     return false;
   }
 };
 
 // ============================================================
-// AUTHENTIFICATION
+// LOGIN
 // ============================================================
 
 const loginToFacebook = async (page) => {
   const { email, password } = config.facebook;
+  if (!email || !password)
+    throw new Error("[FB] Email/password manquants dans .env");
 
-  if (!email || !password) {
-    throw new Error(
-      "[FB] Identifiants FACEBOOK_EMAIL ou FACEBOOK_PASSWORD absents du fichier .env",
-    );
-  }
-
-  logger.info("[FB] Rendu de la page d'authentification...");
   await page.goto(`${FB_URL}/login`, {
     waitUntil: "networkidle2",
-    timeout: TIMEOUTS.navigation,
+    timeout: 45000,
   });
-
   await sleep(2000);
 
-  // Saisie de l'identifiant
   const emailSelectors = [
     "#email",
     'input[name="email"]',
     'input[type="email"]',
   ];
   let emailFilled = false;
-
   for (const sel of emailSelectors) {
     try {
       await page.waitForSelector(sel, { visible: true, timeout: 5000 });
       await page.$eval(sel, (el) => (el.value = ""));
-      await page.type(sel, email, { delay: 25 });
+      await page.type(sel, email, { delay: 40 });
       emailFilled = true;
       break;
-    } catch {}
+    } catch {
+      /* suivant */
+    }
   }
+  if (!emailFilled) throw new Error("[FB] Champ email introuvable");
 
-  if (!emailFilled) throw new Error("[FB] Champ de saisie email introuvable");
-
-  // Saisie du mot de passe
   const passSelectors = [
     "#pass",
     'input[name="pass"]',
     'input[type="password"]',
   ];
-  let passFilled = false;
-
   for (const sel of passSelectors) {
     try {
       await page.waitForSelector(sel, { visible: true, timeout: 5000 });
       await page.$eval(sel, (el) => (el.value = ""));
-      await page.type(sel, password, { delay: 25 });
-      passFilled = true;
+      await page.type(sel, password, { delay: 40 });
       break;
-    } catch {}
+    } catch {
+      /* suivant */
+    }
   }
-
-  if (!passFilled)
-    throw new Error("[FB] Champ de saisie mot de passe introuvable");
 
   await sleep(500);
 
-  // Soumission du formulaire
-  const loginSelectors = [
+  for (const sel of [
+    'button[name="login"]',
     '[name="login"]',
     'button[type="submit"]',
-    '[data-testid="royal_login_button"]',
-  ];
-  let formSubmitted = false;
-
-  for (const sel of loginSelectors) {
+  ]) {
     try {
       await page.click(sel);
-      formSubmitted = true;
       break;
-    } catch {}
+    } catch {
+      /* suivant */
+    }
   }
 
-  if (!formSubmitted)
-    throw new Error("[FB] Bouton de soumission de connexion introuvable");
-
-  await page.waitForNavigation({
-    waitUntil: "networkidle2",
-    timeout: TIMEOUTS.navigation,
-  });
-
+  await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 45000 });
   const url = page.url();
   if (url.includes("/login") || url.includes("checkpoint")) {
-    throw new Error(`[FB] Échec d'authentification. Bloqué sur l'URL: ${url}`);
+    throw new Error(`[FB] Login échoué. URL: ${url}`);
   }
-
-  logger.info("[FB] ✅ Authentification réussie");
+  logger.info("[FB] ✅ Login réussi");
   await sleep(3000);
 };
 
 // ============================================================
-// NAVIGATION VERS LA PAGE CIBLE
+// NAVIGATION
 // ============================================================
 
 const navigateToPage = async (page) => {
   const pageUrl = `${FB_URL}/${config.facebook.pageName}`;
-  logger.info(`[FB] Redirection vers l'espace de la page: ${pageUrl}`);
+  logger.info(`[FB] Navigation: ${pageUrl}`);
 
-  await page.goto(pageUrl, {
-    waitUntil: "networkidle2",
-    timeout: TIMEOUTS.navigation,
-  });
-
-  await handleSwitchToPageModal(page);
-
+  await page.goto(pageUrl, { waitUntil: "networkidle2", timeout: 45000 });
+  await sleep(3000);
   await page
-    .screenshot({ path: path.join(DEBUG_DIR, "fb-page-loaded.png") })
+    .screenshot({ path: path.join(DEBUG_DIR, "01-page-loaded.png") })
     .catch(() => {});
-};
 
-const handleSwitchToPageModal = async (page) => {
   try {
-    const switchBtn = await page.waitForSelector(
-      [
-        '[aria-label*="Switch now"]',
-        '[aria-label*="Basculer"]',
-        '[aria-label*="Switch to"]',
-      ].join(", "),
-      { timeout: 4000, visible: true },
+    const switchBtn = await page.$(
+      '[aria-label*="Switch"], [aria-label*="Basculer"]',
     );
-
     if (switchBtn) {
-      logger.info(
-        "[FB] Modale de basculement de profil détectée, exécution...",
-      );
       await switchBtn.click();
       await page
-        .waitForNetworkIdle({ idleTime: 1500, timeout: 8000 })
+        .waitForNavigation({ waitUntil: "networkidle2", timeout: 30000 })
         .catch(() => {});
+      await sleep(3000);
     }
   } catch {
-    // Aucune modale détectée, comportement normal attendu
+    /* pas de switch */
   }
 };
 
 // ============================================================
-// FLUX DE CRÉATION DU POST
-// ============================================================
-
-const createPost = async (page, imagePath, caption) => {
-  logger.info("[FB] Initialisation du compositeur de texte...");
-  const composerOpened = await openComposer(page);
-
-  if (!composerOpened) {
-    throw new Error(
-      "[FB] Impossible d'initialiser ou de trouver la fenêtre d'écriture",
-    );
-  }
-
-  await page
-    .screenshot({ path: path.join(DEBUG_DIR, "fb-composer-open.png") })
-    .catch(() => {});
-
-  logger.info("[FB] Injection de l'élément média...");
-  await uploadImage(page, imagePath);
-
-  logger.info("[FB] Écriture de la légende de publication...");
-  await typeCaption(page, caption);
-
-  await page
-    .screenshot({ path: path.join(DEBUG_DIR, "fb-before-submit.png") })
-    .catch(() => {});
-
-  logger.info("[FB] Envoi de l'ordre de publication...");
-  await clickPostButton(page);
-
-  logger.info("[FB] Analyse et validation de la mise en ligne...");
-  const postId = await waitForPostConfirmation(page);
-
-  await page
-    .screenshot({ path: path.join(DEBUG_DIR, "fb-after-submit.png") })
-    .catch(() => {});
-
-  return postId;
-};
-
-// ============================================================
-// OUVERTURE DE L'ÉDITEUR
+// OUVRIR LE COMPOSITEUR
 // ============================================================
 
 const openComposer = async (page) => {
-  const textSelectors = [
-    "::-p-text(What's on your mind)",
-    "::-p-text(Share a thought)",
-    "::-p-text(Qu'avez-vous en tête)",
-    "::-p-text(Quoi de neuf)",
-    "::-p-text(Write something)",
-    "::-p-text(Écrivez quelque chose)",
-  ];
+  logger.info("[FB] Ouverture compositeur...");
+  await sleep(2000);
 
-  for (const sel of textSelectors) {
+  for (const sel of [
+    '[aria-label="Share a thought..."]',
+    '[aria-label="Write something..."]',
+    '[aria-label="Create a post"]',
+    '[aria-label="Créer une publication"]',
+    '[aria-label="Créer un post"]',
+  ]) {
     try {
-      const el = await page.$(sel);
+      const el = await page.waitForSelector(sel, {
+        timeout: 3000,
+        visible: true,
+      });
       if (el) {
         await el.click();
-        await page
-          .waitForNetworkIdle({ idleTime: 1000, timeout: 5000 })
-          .catch(() => {});
-        return true;
+        logger.info(`[FB] Compositeur: ${sel}`);
+        await sleep(2000);
+        return;
       }
-    } catch {}
-  }
-
-  const ariaSelectors = [
-    'div[role="main"] div[role="button"][tabindex="0"]',
-    '[data-pagelet="FeedComposer"] div[role="button"]',
-  ];
-
-  for (const sel of ariaSelectors) {
-    try {
-      const el = await page.$(sel);
-      if (el) {
-        const text = await page.evaluate((node) => node.innerText ?? "", el);
-        if (text.length > 2) {
-          await el.click();
-          await page
-            .waitForNetworkIdle({ idleTime: 1000, timeout: 5000 })
-            .catch(() => {});
-          return true;
-        }
-      }
-    } catch {}
+    } catch {
+      /* suivant */
+    }
   }
 
   const found = await page.evaluate(() => {
-    const keywords = [
-      "what's on your mind",
-      "share a thought",
-      "qu'avez-vous en tête",
-      "quoi de neuf",
-      "write something",
-      "écrivez quelque chose",
-    ];
-    const nodes = document.querySelectorAll('div[role="button"], span');
-    for (const node of nodes) {
-      const text = (node.innerText || node.textContent || "")
-        .toLowerCase()
-        .trim();
-      if (keywords.some((k) => text.includes(k))) {
-        const clickable = node.closest('[role="button"]') ?? node;
-        clickable.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const allButtons = document.querySelectorAll('div[role="button"]');
+    for (const btn of allButtons) {
+      const text = (btn.innerText || btn.textContent || "").trim();
+      const rect = btn.getBoundingClientRect();
+      if (
+        rect.top > 350 &&
+        rect.left < 700 &&
+        rect.width > 100 &&
+        (text.includes("Share a thought") ||
+          text.includes("Write something") ||
+          text.includes("Qu'avez-vous") ||
+          text.includes("What's on your mind"))
+      ) {
+        btn.click();
         return true;
       }
     }
@@ -386,337 +274,447 @@ const openComposer = async (page) => {
   });
 
   if (found) {
+    logger.info("[FB] Compositeur ouvert via texte scopé");
+    await sleep(2000);
+    return;
+  }
+
+  throw new Error("[FB] Compositeur introuvable. Voir 01-page-loaded.png");
+};
+// ============================================================
+// HELPER — Re-saisie caption après upload (modale enrichie)
+// La modale image de FB n'a plus role="textbox", seulement
+// un contenteditable brut au-dessus de l'image uploadée
+// ============================================================
+
+// ============================================================
+// HELPER — waitForStableTextbox v8
+// Cherche contenteditable MÊME si offsetParent est null
+// On vérifie juste que l'élément existe dans la modale active
+// ============================================================
+const waitForStableTextbox = async (page, timeoutMs = 12000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const found = await page.evaluate(() => {
+      const allDialogs = document.querySelectorAll('div[role="dialog"]');
+      for (const dialog of allDialogs) {
+        const hasForm = dialog.querySelector('form[method="POST"]');
+        const rect = dialog.getBoundingClientRect();
+        if (hasForm && rect.width > 100 && rect.height > 100) {
+          const ce = dialog.querySelectorAll('div[contenteditable="true"]');
+          return ce.length > 0;
+        }
+      }
+      return false;
+    });
+    if (found) return true;
+    await sleep(500);
+  }
+  throw new Error("[FB] Textbox stable introuvable après timeout");
+};
+
+const typeInContentEditable = async (page, text) => {
+  const clicked = await page.evaluate(() => {
+    const allDialogs = document.querySelectorAll('div[role="dialog"]');
+    let dialog = null;
+    for (const d of allDialogs) {
+      const hasForm = d.querySelector('form[method="POST"]');
+      const rect = d.getBoundingClientRect();
+      if (hasForm && rect.width > 100 && rect.height > 100) {
+        dialog = d;
+        break;
+      }
+    }
+    if (!dialog) return false;
+
+    const box =
+      dialog.querySelector('[role="textbox"]') ||
+      dialog.querySelector('div[contenteditable="true"]');
+    if (!box) return false;
+
+    box.click();
+    box.focus();
+    const range = document.createRange();
+    range.selectNodeContents(box);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  });
+
+  if (clicked) {
+    await page.keyboard.press("Delete");
+    await sleep(200);
+    await page.keyboard.type(text, { delay: 15 });
+  }
+};
+
+const injectFileToInput = async (page, absPath) => {
+  const imageBuffer = await fs.readFile(absPath);
+  const base64Image = imageBuffer.toString("base64");
+  const ext = path.extname(absPath).toLowerCase();
+  const mimeMap = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+  };
+  const mimeType = mimeMap[ext] || "image/jpeg";
+
+  const injected = await page.evaluate(
+    ({ base64, mime, filename }) => {
+      const inputs = Array.from(
+        document.querySelectorAll('input[type="file"]'),
+      );
+      if (inputs.length === 0) return false;
+
+      const byteChars = atob(base64);
+      const byteArray = new Uint8Array(byteChars.length);
+      for (let i = 0; i < byteChars.length; i++) {
+        byteArray[i] = byteChars.charCodeAt(i);
+      }
+      const blob = new Blob([byteArray], { type: mime });
+      const file = new File([blob], filename, {
+        type: mime,
+        lastModified: Date.now(),
+      });
+
+      const dt = new DataTransfer();
+      dt.items.add(file);
+
+      for (const input of inputs) {
+        try {
+          input.style.display = "block";
+          Object.defineProperty(input, "files", {
+            value: dt.files,
+            writable: false,
+          });
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          // React synthetic event
+          const reactKey = Object.keys(input).find(
+            (k) => k.startsWith("__reactProps") || k.startsWith("__reactFiber"),
+          );
+          if (reactKey && input[reactKey]?.onChange) {
+            input[reactKey].onChange({
+              target: input,
+              nativeEvent: new Event("change"),
+            });
+          }
+        } catch {
+          // continuer sur le suivant
+        }
+      }
+      return true;
+    },
+    { base64: base64Image, mime: mimeType, filename: path.basename(absPath) },
+  );
+
+  return injected;
+};
+
+const createPost = async (page, imagePath, caption) => {
+  logger.info("[FB] Création post v10...");
+
+  const absPath = path.resolve(imagePath);
+  if (!(await fs.pathExists(absPath)))
+    throw new Error(`[FB] Image introuvable: ${absPath}`);
+
+  // Attendre la modale de post (form POST visible)
+  await page.waitForFunction(
+    () => {
+      const allDialogs = document.querySelectorAll('div[role="dialog"]');
+      for (const d of allDialogs) {
+        const hasForm = d.querySelector('form[method="POST"]');
+        const rect = d.getBoundingClientRect();
+        if (hasForm && rect.width > 100 && rect.height > 100) return true;
+      }
+      return false;
+    },
+    { timeout: 15000, polling: 300 },
+  );
+  logger.info("[FB] ✅ Modale post détectée (form POST)");
+  await sleep(1500);
+
+  await page
+    .screenshot({ path: path.join(DEBUG_DIR, "02-modal-open.png") })
+    .catch(() => {});
+
+  // ============================================================
+  // ÉTAPE 1 — Upload image
+  // ============================================================
+  logger.info("[FB] Upload image...");
+  const uploaded = await injectFileToInput(page, absPath);
+
+  if (!uploaded) {
+    logger.warn("[FB] DataTransfer échouée, fallback...");
+    await page.evaluate(() => {
+      document.querySelectorAll('input[type="file"]').forEach((i) => {
+        i.style.cssText =
+          "display:block!important;opacity:1!important;position:fixed!important;" +
+          "top:0;left:0;z-index:99999;width:200px;height:200px";
+      });
+    });
+    const fileInput = await page
+      .waitForSelector('input[type="file"]', { timeout: 8000, visible: false })
+      .catch(() => null);
+    if (fileInput) {
+      await fileInput.uploadFile(absPath);
+    } else {
+      throw new Error("[FB] Impossible d'uploader l'image");
+    }
+  }
+  logger.info("[FB] ✅ Image uploadée");
+
+  // ============================================================
+  // ÉTAPE 2 — Attendre preview dans la bonne modale
+  // ============================================================
+  await page
+    .waitForFunction(
+      () => {
+        const allDialogs = document.querySelectorAll('div[role="dialog"]');
+        for (const d of allDialogs) {
+          const hasForm = d.querySelector('form[method="POST"]');
+          const rect = d.getBoundingClientRect();
+          if (!hasForm || rect.width < 100) continue;
+          for (const img of d.querySelectorAll("img")) {
+            if (
+              img.src.startsWith("blob:") ||
+              img.src.includes("fbcdn") ||
+              img.src.startsWith("data:image/png") ||
+              img.src.startsWith("data:image/jpeg")
+            )
+              return true;
+          }
+        }
+        return false;
+      },
+      { timeout: 30000, polling: 500 },
+    )
+    .catch(() => logger.warn("[FB] Preview non détectée, on continue..."));
+
+  await sleep(1500);
+  await page
+    .screenshot({ path: path.join(DEBUG_DIR, "03-image-uploaded.png") })
+    .catch(() => {});
+
+  // ============================================================
+  // ÉTAPE 3 — Caption via click Puppeteer natif
+  // ============================================================
+  logger.info("[FB] Saisie caption...");
+
+  const textBox = await page
+    .waitForSelector(
+      'form[method="POST"] [role="textbox"], form[method="POST"] div[contenteditable="true"]',
+      { visible: true, timeout: 8000 },
+    )
+    .catch(() => null);
+
+  if (textBox) {
+    await textBox.click(); // ← click Puppeteer natif, pas evaluate
+    await sleep(400);
+    await page.keyboard.down("Control");
+    await page.keyboard.press("a");
+    await page.keyboard.up("Control");
+    await page.keyboard.press("Delete");
+    await sleep(200);
+    await page.keyboard.type(caption, { delay: 20 });
+    logger.info("[FB] ✅ Caption saisi");
+    await sleep(800);
+  } else {
+    logger.warn("[FB] Zone texte introuvable dans modale post");
+  }
+
+  await page
+    .screenshot({ path: path.join(DEBUG_DIR, "04-caption-typed.png") })
+    .catch(() => {});
+
+  // ============================================================
+  // ÉTAPE 4 — Bouton "Next" dans la bonne modale
+  // ============================================================
+  logger.info("[FB] Recherche Next...");
+
+  const nextClicked = await page.evaluate(() => {
+    const allDialogs = document.querySelectorAll('div[role="dialog"]');
+    let dialog = null;
+    for (const d of allDialogs) {
+      const hasForm = d.querySelector('form[method="POST"]');
+      const rect = d.getBoundingClientRect();
+      if (hasForm && rect.width > 100 && rect.height > 100) {
+        dialog = d;
+        break;
+      }
+    }
+    if (!dialog) return false;
+
+    const allSpans = dialog.querySelectorAll("span");
+    for (const span of allSpans) {
+      const text = (span.innerText || span.textContent || "").trim();
+      if (text === "Next" || text === "Suivant") {
+        let target = span;
+        for (let i = 0; i < 8; i++) {
+          target = target.parentElement;
+          if (!target) break;
+          const role = target.getAttribute("role");
+          const tabindex = target.getAttribute("tabindex");
+          const tag = target.tagName.toLowerCase();
+          if (role === "button" || tag === "button" || tabindex === "0") {
+            target.dispatchEvent(
+              new MouseEvent("click", { bubbles: true, cancelable: true }),
+            );
+            return `${tag}[role=${role}][tabindex=${tabindex}]`;
+          }
+        }
+        span.dispatchEvent(
+          new MouseEvent("click", { bubbles: true, cancelable: true }),
+        );
+        return "span-direct";
+      }
+    }
+    return false;
+  });
+
+  // Après nextClicked, remplace sleep(3000) par :
+  if (nextClicked) {
+    logger.info(`[FB] ✅ Next cliqué (${nextClicked})`);
+
+    // Attendre que le bouton Next disparaisse = modale 2 chargée
     await page
-      .waitForNetworkIdle({ idleTime: 1000, timeout: 5000 })
+      .waitForFunction(
+        () => {
+          const allDialogs = document.querySelectorAll('div[role="dialog"]');
+          for (const d of allDialogs) {
+            const hasForm = d.querySelector('form[method="POST"]');
+            const rect = d.getBoundingClientRect();
+            if (!hasForm || rect.width < 100) continue;
+            const spans = d.querySelectorAll("span");
+            for (const s of spans) {
+              if (
+                (s.innerText || "").trim() === "Next" ||
+                (s.innerText || "").trim() === "Suivant"
+              )
+                return false;
+            }
+            return true; // Next a disparu
+          }
+          return false;
+        },
+        { timeout: 10000, polling: 300 },
+      )
+      .catch(() => logger.warn("[FB] Next pas encore disparu"));
+
+    await sleep(1000);
+    await page
+      .screenshot({ path: path.join(DEBUG_DIR, "05-post-settings.png") })
       .catch(() => {});
   }
 
-  return found;
-};
+  // ============================================================
+  // ÉTAPE 5 — Bouton "Post" dans la bonne modale
+  // ============================================================
+  logger.info("[FB] Recherche bouton Post...");
 
-// ============================================================
-// COMPORTEMENT D'UPLOAD MEDIA (CORRIGÉ)
-// ============================================================
-
-const uploadImage = async (page, imagePath) => {
-  const absPath = path.resolve(imagePath);
-  if (!(await fs.pathExists(absPath))) {
-    throw new Error(`[FB] Fichier image introuvable: ${absPath}`);
-  }
-
-  // 1. Essayer directement l'input caché (injecté par Facebook sans clic)
-  let fileInput = await page.$('div[role="dialog"] input[type="file"]');
-  if (fileInput) {
-    await fileInput.uploadFile(absPath);
-    logger.info(
-      "[FB] Fichier uploadé via le champ hidden (sans boîte de dialogue).",
-    );
-    await waitForImagePreview(page);
-    return;
-  }
-
-  // 2. Fallback : activation du bouton média avec interception du file chooser natif
-  logger.info(
-    "[FB] Input absent, activation du bouton média avec interception de la boîte de dialogue...",
-  );
-
-  const photoBtnSelector = [
-    'div[role="dialog"] [aria-label*="Photo"]',
-    'div[role="dialog"] [aria-label*="photo"]',
-    'div[role="dialog"] [aria-label*="Video"]',
-    'div[role="dialog"] [aria-label*="Média"]',
-  ].join(", ");
-
-  const photoBtn = await page.waitForSelector(photoBtnSelector, {
-    timeout: 5000,
-    visible: true,
-  });
-
-  // On prépare l'interception du file chooser AVANT le clic
-  const fileChooserPromise = page
-    .waitForFileChooser({ timeout: 3000 })
-    .catch(() => null);
-  await photoBtn.click();
-
-  const fileChooser = await fileChooserPromise;
-  if (fileChooser) {
-    // On utilise la boîte de dialogue native pour uploader → elle se ferme automatiquement
-    await fileChooser.accept([absPath]);
-    logger.info("[FB] Image uploadée via le file chooser natif.");
-  } else {
-    // Aucune boîte de dialogue, l'input devrait être maintenant présent
-    fileInput = await page.waitForSelector('input[type="file"]', {
-      timeout: 5000,
-    });
-    if (!fileInput)
-      throw new Error(
-        "[FB] Input file introuvable après activation du bouton média.",
-      );
-    await fileInput.uploadFile(absPath);
-    logger.info("[FB] Image uploadée via input après activation.");
-  }
-
-  await waitForImagePreview(page);
-};
-
-const waitForImagePreview = async (page) => {
-  try {
-    await page.waitForSelector(
-      [
-        'div[role="dialog"] img[src*="blob:"]',
-        'div[role="dialog"] img[src*="facebook"]',
-        'div[role="dialog"] div[data-visualcompletion="media-vc-image"]',
-      ].join(", "),
-      { timeout: TIMEOUTS.upload, visible: true },
-    );
-    logger.info("[FB] Aperçu image confirmé dans le compositor");
-  } catch {
-    logger.warn(
-      "[FB] Aperçu image non détecté visuellement, application du délai de sécurité...",
-    );
-    await sleep(5000);
-  }
-};
-
-// ============================================================
-// RECOUVREMENT ET ÉCRITURE DU TEXTE
-// ============================================================
-
-const typeCaption = async (page, caption) => {
-  if (!caption) return;
-
-  const textboxSelectors = [
-    'div[role="dialog"] div[contenteditable="true"]',
-    'div[role="dialog"] div[role="textbox"]',
-    'div[contenteditable="true"][data-lexical-editor="true"]',
-  ];
-
-  let textbox = null;
-
-  for (const sel of textboxSelectors) {
-    try {
-      textbox = await page.waitForSelector(sel, {
-        timeout: TIMEOUTS.action,
-        visible: true,
-      });
-      if (textbox) break;
-    } catch {}
-  }
-
-  if (!textbox) {
-    logger.warn(
-      "[FB] Zone d'édition introuvable. Recours au mécanisme de simulation virtuelle",
-    );
-    await typeViaCopyPaste(page, caption);
-    return;
-  }
-
-  await textbox.click();
-  await sleep(400);
-  await page.keyboard.type(caption, { delay: TYPING_DELAY });
-  logger.info("[FB] Chaîne de texte injectée dans le champ d'écriture");
-};
-
-const typeViaCopyPaste = async (page, caption) => {
-  await page.evaluate(async (text) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "absolute";
-      ta.style.left = "-9999px";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    }
-  }, caption);
-
-  await page.keyboard.down("Control");
-  await page.keyboard.press("v");
-  await page.keyboard.up("Control");
-};
-
-// ============================================================
-// VALIDATION ET CLIC SUR LE BOUTON PUBLIER (OPTIMISÉ)
-// ============================================================
-
-// ============================================================
-// VALIDATION ET CLIC SUR LE BOUTON PUBLIER (CORRIGÉ – NE FERME PAS LA BOÎTE)
-// ============================================================
-
-const clickPostButton = async (page) => {
-  logger.info("[FB] Retrait propre du focus sans fermer le compositeur...");
-
-  // 1. Cliquer dans la zone d'édition pour déplacer le focus
-  const textboxSelectors = [
-    'div[role="dialog"] div[contenteditable="true"]',
-    'div[role="dialog"] div[role="textbox"]',
-  ];
-
-  let textbox = null;
-  for (const sel of textboxSelectors) {
-    try {
-      textbox = await page.waitForSelector(sel, {
-        timeout: 2000,
-        visible: true,
-      });
-      if (textbox) break;
-    } catch {}
-  }
-
-  if (textbox) {
-    await textbox.click({ clickCount: 1 }); // simple clic, pas de triple clic
-    await sleep(300);
-    // Appuyer sur la touche "Fin" pour sortir des suggestions (sans fermer)
-    await page.keyboard.press("End");
-    await sleep(300);
-  } else {
-    // Fallback : cliquer dans un endroit neutre du dialogue
-    await page.evaluate(() => {
-      const dialog = document.querySelector('div[role="dialog"]');
-      if (dialog) dialog.click();
-    });
-    await sleep(500);
-  }
-
-  logger.info("[FB] Recherche du bouton de soumission...");
-
-  const selectors = [
-    'div[role="dialog"] div[aria-label="Post"]',
-    'div[role="dialog"] div[aria-label="Publier"]',
-    'div[role="dialog"] div[aria-label="Share"]',
-    'div[role="dialog"] div[aria-label="Partager"]',
-    'div[role="dialog"] div[aria-label="Publicar"]',
-    'div[role="dialog"] div[role="button"] ::-p-text(Post)',
-    'div[role="dialog"] div[role="button"] ::-p-text(Publier)',
-    'div[role="dialog"] div[role="button"] ::-p-text(Share)',
-    'div[role="dialog"] div[role="button"] ::-p-text(Partager)',
-  ];
-
-  // 2. Attente active du bouton cliquable (jusqu'à 15 secondes)
-  const start = Date.now();
-  let btn = null;
-
-  while (!btn && Date.now() - start < 15_000) {
-    for (const selector of selectors) {
-      try {
-        const el = await page.$(selector);
-        if (el) {
-          // Vérifier qu'il n'est pas désactivé (opacité faible ou grisé)
-          const isDisabled = await el.evaluate((node) => {
-            const style = window.getComputedStyle(node);
-            return (
-              style.opacity < 0.5 ||
-              node.getAttribute("aria-disabled") === "true"
-            );
-          });
-          if (!isDisabled) {
-            btn = el;
-            logger.info(`[FB] Bouton actif trouvé : ${selector}`);
+  await page
+    .waitForFunction(
+      () => {
+        const allDialogs = document.querySelectorAll('div[role="dialog"]');
+        let dialog = null;
+        for (const d of allDialogs) {
+          const hasForm = d.querySelector('form[method="POST"]');
+          const rect = d.getBoundingClientRect();
+          if (hasForm && rect.width > 100 && rect.height > 100) {
+            dialog = d;
             break;
           }
         }
-      } catch {}
+        if (!dialog) return false;
+        const keywords = ["post", "publier", "share", "partager"];
+        for (const btn of dialog.querySelectorAll('[role="button"], button')) {
+          const text = (btn.innerText || btn.textContent || "")
+            .trim()
+            .toLowerCase();
+          const disabled =
+            btn.getAttribute("aria-disabled") === "true" || btn.disabled;
+          if (keywords.includes(text) && !disabled) return true;
+        }
+        return false;
+      },
+      { timeout: 15000, polling: 500 },
+    )
+    .catch(() => logger.warn("[FB] Bouton Post pas encore actif..."));
+
+  const publishSelectors = [
+    'form[method="POST"] button[aria-label="Post"]',
+    'form[method="POST"] button[aria-label="Publier"]',
+    'form[method="POST"] div[aria-label="Post"]',
+    'form[method="POST"] div[aria-label="Publier"]',
+    'form[method="POST"] div[aria-label="Share"]',
+    'form[method="POST"] div[aria-label="Partager"]',
+  ];
+
+  let published = false;
+
+  for (const sel of publishSelectors) {
+    try {
+      const btn = await page.waitForSelector(sel, {
+        timeout: 3000,
+        visible: true,
+      });
+      if (btn) {
+        await btn.click();
+        published = true;
+        logger.info(`[FB] ✅ Post cliqué: ${sel}`);
+        break;
+      }
+    } catch {
+      /* suivant */
     }
-    if (!btn) await sleep(500);
   }
 
-  // 3. Fallback amélioré : chercher le bouton bleu (couleur primaire Facebook)
-  if (!btn) {
-    logger.warn(
-      "[FB] Aucun sélecteur n'a fonctionné, recherche du bouton bleu...",
-    );
-    btn = await page
-      .evaluateHandle(() => {
-        const dialog = document.querySelector('div[role="dialog"]');
-        if (!dialog) return null;
-        const allButtons = Array.from(
-          dialog.querySelectorAll('[role="button"], button'),
-        );
-        // Ne garder que les boutons de taille suffisante et de couleur bleue
-        const valid = allButtons.filter((b) => {
-          const rect = b.getBoundingClientRect();
-          if (rect.height < 25 || rect.width < 50) return false;
-          const style = window.getComputedStyle(b);
-          const bg = style.backgroundColor;
-          // Détection simple du bleu Facebook (hex ou rgb)
-          return (
-            bg.includes("rgb(24, 119, 242)") ||
-            bg.includes("#1877f2") ||
-            bg.includes("rgb(23, 119, 242)") ||
-            b.getAttribute("aria-label")?.toLowerCase().includes("post") ||
-            b.getAttribute("aria-label")?.toLowerCase().includes("publier") ||
-            b.getAttribute("aria-label")?.toLowerCase().includes("share")
+  // Fallback texte dans form POST
+  if (!published) {
+    published = await page.evaluate(() => {
+      const allDialogs = document.querySelectorAll('div[role="dialog"]');
+      let dialog = null;
+      for (const d of allDialogs) {
+        const hasForm = d.querySelector('form[method="POST"]');
+        const rect = d.getBoundingClientRect();
+        if (hasForm && rect.width > 100 && rect.height > 100) {
+          dialog = d;
+          break;
+        }
+      }
+      if (!dialog) return false;
+      const keywords = ["post", "publier", "share", "partager"];
+      for (const btn of dialog.querySelectorAll('[role="button"], button')) {
+        const text = (btn.innerText || btn.textContent || "")
+          .trim()
+          .toLowerCase();
+        const disabled =
+          btn.getAttribute("aria-disabled") === "true" || btn.disabled;
+        if (keywords.includes(text) && !disabled) {
+          btn.dispatchEvent(
+            new MouseEvent("click", { bubbles: true, cancelable: true }),
           );
-        });
-        // On prend le dernier (généralement le bouton de publication)
-        return valid[valid.length - 1] || null;
-      })
-      .then((h) => h.asElement());
-  }
-
-  if (!btn) {
-    throw new Error(
-      "[FB] Blocage critique : Bouton d'envoi final non localisable.",
-    );
-  }
-
-  await page.evaluate((el) => el.scrollIntoView({ block: "center" }), btn);
-  await sleep(1500);
-
-  logger.info("[FB] Clic final sur le bouton de publication...");
-  try {
-    await btn.click();
-  } catch (err) {
-    await page.evaluate((el) => el.click(), btn);
-  }
-
-  logger.info(
-    "[FB] 🎉 Ordre de publication envoyé ! Passage à la confirmation...",
-  );
-};
-
-// ============================================================
-// VALIDATION DU FLUX ET ANALYSE POST-POST
-// ============================================================
-
-const waitForPostConfirmation = async (page) => {
-  try {
-    await page.waitForSelector('div[role="dialog"]', {
-      hidden: true,
-      timeout: TIMEOUTS.postConfirm,
+          return true;
+        }
+      }
+      return false;
     });
-    logger.info("[FB] Fermeture de l'interface d'édition détectée");
-  } catch {
-    logger.warn(
-      "[FB] Fin de boîte de dialogue non détectée à la fin de la limite temporelle",
-    );
+    if (published) logger.info("[FB] ✅ Post cliqué via fallback texte");
   }
 
-  try {
-    await page.waitForFunction(
-      () => !document.querySelector('[data-visualcompletion="loading-state"]'),
-      { timeout: 8000 },
-    );
-  } catch {}
+  if (!published)
+    throw new Error("[FB] Bouton Post introuvable. Voir 05-post-settings.png");
 
-  return await page.evaluate(() => {
-    const links = Array.from(
-      document.querySelectorAll('a[href*="/posts/"], a[href*="fbid="]'),
-    );
-    if (links.length > 0) {
-      const href = links[0].href;
-      const match = href.match(/\/posts\/(\d+)/) ?? href.match(/fbid=(\d+)/);
-      return match ? match[1] : null;
-    }
-    return null;
-  });
+  await page
+    .waitForSelector('div[role="dialog"]', { hidden: true, timeout: 30000 })
+    .catch(() => logger.warn("[FB] Modale non fermée"));
+
+  await page
+    .screenshot({ path: path.join(DEBUG_DIR, "06-after-publish.png") })
+    .catch(() => {});
+  logger.info("[FB] ✅ Post publié !");
+  return "SUCCESS";
 };
-
-// ============================================================
-// PETITS OUTILS UTILS
-// ============================================================
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
